@@ -34,10 +34,13 @@ For each forecast hour, separately:
 1. Take the comparables with both an hour-1 print and an hour-h print
    (missing hours are skipped, nothing is interpolated).
 2. Keep the 18 nearest in |log(v1) - log(p1)|.
-3. Fit log-ratio = a + b * log(v1) by least squares on those neighbours.
+3. Fit log-ratio = a + b * log(v1) by least squares on those neighbours,
+   with the slope clamped to <= 0 (a positive fitted slope is window noise;
+   extrapolating it at a huge hour-1 print points the wrong way).
 4. Predict at log(p1); the five quantiles are the prediction plus standard
-   normal quantiles times the residual standard deviation (n - 2 denominator,
-   floored at 0.08 log units).
+   normal quantiles times the residual spread: the larger of the residual
+   standard deviation (n - 2 denominator) and 1.4826 times the residuals'
+   median absolute deviation, floored at 0.08 log units.
 5. Exponentiate and anchor on p1.
 
 Hours with fewer than 3 usable comparables fall back to the persistence
@@ -51,7 +54,8 @@ the log scale over hours 2..24 x 5 levels):
 
 | Model | Mean pinball loss (log) |
 |---|---|
-| This forecaster | 0.184 |
+| This forecaster (v2: slope clamp + MAD bands) | 0.183 |
+| Previous version (v1) | 0.184 |
 | Persistence baseline (starter) | 0.465 |
 
 That is 60% lower loss, winning 28 of 37 cases. The 9 losses are all small

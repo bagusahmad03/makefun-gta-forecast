@@ -1,24 +1,32 @@
 """Forecast Twitch concurrent viewers for a game's launch day, hours 2..24 (UTC).
 
-Model: local log-linear regression on the launch's hour-1 print.
-
-The case's comparables are past launches' hourly curves. For each past launch we
-know its hour-1 print v1 and its viewers at every later hour h. The log-ratio
-log(viewers_h / v1) depends strongly on the size of v1 itself: launches that
-were already huge in hour 1 stay comparatively flat through the day, while
-launches with a tiny hour 1 (unlock still ahead, quiet early hours) explode
-later. The correlation between log(v1) and the log-ratio reaches about -0.9 by
-the evening hours, so a single pooled shape fits nobody well.
+Model: local log-linear regression on the launch's hour-1 print. This is v2
+of the entry shipped as v1: the same model, plus two small guards.
+(1) Slope clamp: a local fit's slope is clamped to never go positive. The
+evidence across all 37 past launches is a strong NEGATIVE relation between
+log(hour-1 viewers) and the log-ratio of later hours to hour 1 (correlation
+about -0.9 by the evening): launches already huge in hour 1 stay flat, small
+hour-1 launches explode later. A fitted positive slope can only be sampling
+noise in a 18-neighbour window, and extrapolating it at a huge hour-1 print
+(as GTA VI's will be) points the forecast the wrong way. When the clamp
+binds, the hour's prediction is the neighbours' mean log-ratio instead.
+(2) MAD-aware band width: the band's spread is the larger of the residual
+standard deviation and 1.4826 times the residuals' median absolute deviation,
+so a fit whose squared residuals happen to look small (one lucky window)
+cannot collapse the bands below what the typical absolute miss implies.
 
 For each forecast hour h, separately:
   1. Take the comparables that have both an hour-1 print and an hour-h print.
   2. Keep the K = 18 nearest in |log(v1) - log(p1)|, where p1 is this case's
      hour-1 print (ties broken by comparable name, so the choice is
      deterministic).
-  3. Fit log-ratio = a + b * log(v1) by least squares on those neighbours.
+  3. Fit log-ratio = a + b * log(v1) by least squares on those neighbours,
+     with b clamped to <= 0 (see above).
   4. Predict the target's log-ratio at log(p1); the five quantiles are the
-     prediction plus normal quantiles times the residual standard deviation
-     (n - 2 denominator, floored at 0.08 log units so the bands never collapse).
+     prediction plus normal quantiles times the residual spread: the larger
+     of the residual standard deviation (n - 2 denominator) and 1.4826 times
+     the residuals' median absolute deviation, floored at 0.08 log units so
+     the bands never collapse.
   5. Exponentiate and anchor on p1.
 
 Hours with fewer than 3 usable comparables fall back to the persistence
@@ -26,11 +34,14 @@ baseline (flat median, spread 0.15 * sqrt(h - 1) in log space). Everything is
 computed from the case file alone: standard library only, no network, no
 randomness, fixed iteration orders, so two runs write identical bytes.
 
-Leave-one-out backtest over the 37 scorable comparables in p00.in (each held
-out in turn, forecast from its hour-1 print alone): mean pinball loss on the
-log scale 0.184, against 0.465 for the persistence baseline (-60%), winning
-28 of 37 cases. The 9 losses are all small (worst +0.04); the wins include
-every small-launch case, where persistence fails catastrophically.
+Backtest (leave-one-out over the 37 scorable comparables in p00.in, each held
+out in turn and forecast from its hour-1 print alone; mean pinball loss on
+the log scale): v1 scored 0.1836 against 0.4648 for the persistence baseline.
+The v2 changes were each checked against a split-half guard (fit on half the
+launches, score the other half) plus 5-fold and repeated random split-halves;
+only changes that improved on EVERY protocol were kept. See RESULTS.md in the
+scratch directory for the full numbers, including everything that was tried
+and rejected.
 
 I/O contract (same as the starter): read every <id>.in in the input directory
 (MAKEFUN_INPUT_DIR outside the grader, else /input), write <id>.out with
@@ -129,8 +140,23 @@ def comparable_curves(case):
     return curves
 
 
+def median(values):
+    """Median of a non-empty list (average of the two middle values if even)."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2:
+        return ordered[n // 2]
+    return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
+
+
 def fit_line(xs, ys):
-    """Least-squares y = a + b*x. Returns (a, b); b = 0 if x has no spread."""
+    """Least-squares y = a + b*x, with the slope clamped to <= 0.
+
+    Returns (a, b); b = 0 if x has no spread, or if the unconstrained fit
+    would slope upward (the clamp: the prediction then equals the mean of
+    ys, the neighbours' mean log-ratio). The clamp binds only on noisy
+    windows; on typical hours the fit is untouched.
+    """
     n = len(xs)
     mx = sum(xs) / n
     my = sum(ys) / n
@@ -138,6 +164,8 @@ def fit_line(xs, ys):
     if sxx == 0:
         return my, 0.0
     b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    if b > 0:
+        return my, 0.0
     return my - b * mx, b
 
 
@@ -160,7 +188,11 @@ def hour_quantiles(p1, hour, curves, z_values):
         pred = a + b * log_p1
         residuals = [y - (a + b * x) for x, y in zip(xs, ys)]
         var = sum(r * r for r in residuals) / max(1, len(residuals) - 2)
-        sd = max(SD_FLOOR, math.sqrt(var))
+        # Spread: the larger of the residual SD and the MAD-implied SD, so a
+        # window that happens to fit tightly cannot collapse the bands.
+        med = median(residuals)
+        mad = median([abs(r - med) for r in residuals])
+        sd = max(SD_FLOOR, math.sqrt(var), 1.4826 * mad)
         return [p1 * math.exp(pred + z * sd) for z in z_values]
     # Too few comparables for this hour: persistence fallback.
     spread = SIGMA * math.sqrt(hour - 1)
